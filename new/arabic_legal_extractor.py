@@ -31,7 +31,7 @@ except ImportError as e:
     sys.exit(1)
 
 try:
-    from gemma_verifier import verify_start_candidates, verify_end_candidates
+    from gemma_verifier import verify_start_candidates, verify_end_candidates, clean_documents_trailing_content
     GEMMA_AVAILABLE = True
 except ImportError:
     GEMMA_AVAILABLE = False
@@ -102,7 +102,17 @@ def extract_legal_documents_from_content(
     (détection, vérification Gemma optionnelle, matching, étiquetage pages).
     """
     start_patterns = extract_start_info(content)
-    print(f"🔍 Found {len(start_patterns)} start patterns (avant vérification)")
+    n_total_detected = len(start_patterns)
+
+    # On ne garde que les textes AVEC signature (قرار/مرسوم/ظهير/قانون/منشور/
+    # مذكرة/مقرر) : les entrées KEYWORDS_NO_SIGNATURE (اعلان, بلاغ, رأي, قائمة
+    # أسماء...) sont écartées ici, avant même la vérification Gemma, pour ne
+    # pas gaspiller des appels API sur des candidats qu'on ne veut pas garder
+    # de toute façon.
+    n_no_sig_dropped = sum(1 for p in start_patterns if not p.get("has_signature", True))
+    start_patterns = [p for p in start_patterns if p.get("has_signature", True)]
+    print(f"🔍 Found {n_total_detected} start patterns "
+          f"({n_no_sig_dropped} sans signature écartés, {len(start_patterns)} retenus)")
 
     end_patterns = extract_signatures_from_text(content)
     print(f"✍️ Found {len(end_patterns)} signature patterns (avant vérification)")
@@ -120,16 +130,22 @@ def extract_legal_documents_from_content(
             end_patterns = verify_end_candidates(content, end_patterns)
             print(f"🤖 Gemma : {n_before - len(end_patterns)} faux positifs de fin écartés "
                   f"({len(end_patterns)} confirmés/gardés)")
+    else:
+        # Sans Gemma, les candidats "flous" (fuzzy_matched -- match approximatif
+        # tolérant une faute d'OCR) ne peuvent pas être confirmés : on les
+        # écarte par précaution plutôt que de risquer un faux positif non
+        # vérifié. Relancer avec Gemma activé permettrait de les récupérer.
+        n_fuzzy = sum(1 for p in start_patterns if p.get("fuzzy_matched"))
+        if n_fuzzy:
+            start_patterns = [p for p in start_patterns if not p.get("fuzzy_matched")]
+            print(f"⚠️  {n_fuzzy} candidat(s) flou(s) (faute d'OCR probable) écarté(s) "
+                  f"car Gemma est désactivé -- relancer sans --no-gemma pour les vérifier.")
 
-    patterns_with_sig = [p for p in start_patterns if p.get("has_signature", True)]
-    patterns_without_sig = [p for p in start_patterns if not p.get("has_signature", True)]
-    print(f"   ✍️  {len(patterns_with_sig)} with signatures")
-    print(f"   📋 {len(patterns_without_sig)} without signatures")
+    print(f"   ✍️  {len(start_patterns)} textes avec signature retenus au total")
 
-    legal_documents = match_patterns_and_extract(content, patterns_with_sig, end_patterns)
-    no_sig_documents = extract_no_signature_documents(content, patterns_without_sig)
+    legal_documents = match_patterns_and_extract(content, start_patterns, end_patterns)
 
-    all_documents = legal_documents + no_sig_documents
+    all_documents = legal_documents
     all_documents.sort(key=lambda x: x["start_position"])
 
     for i, doc in enumerate(all_documents, 1):
@@ -138,6 +154,10 @@ def extract_legal_documents_from_content(
         doc["end_page_number"] = get_page_for_position(doc["end_position"], page_positions)
 
     print(f"📜 Extracted {len(all_documents)} complete legal documents")
+
+    if use_gemma_verification and GEMMA_AVAILABLE:
+        all_documents = clean_documents_trailing_content(content, all_documents)
+
     return all_documents
 
 
@@ -176,6 +196,29 @@ def extract_no_signature_documents(content: str, start_patterns: List[Dict]) -> 
     return documents
 
 
+def _trim_trailing_page_markers(content: str, start_pos: int, end_pos: int) -> int:
+    """
+    Recule end_pos pour exclure tout marqueur '=== Page N ===' (et espaces
+    associés) qui traînerait en fin de document.
+
+    Pourquoi : la limite de fin d'un document est souvent l'en-tête du BO de
+    la page SUIVANTE, qui se trouve forcément APRÈS le marqueur de page.
+    Le marqueur était donc happé au passage. Deux effets indésirables :
+    - un '=== Page N ===' orphelin collé après la signature du texte
+    - un libellé de page faux ('Page: 3-4' pour un texte qui tient
+      entièrement sur la page 3), puisque end_page_number est calculé
+      depuis end_position.
+    """
+    trimmed = content[start_pos:end_pos]
+    pattern = re.compile(r"(?:\s*===\s*Page\s*\d+\s*===\s*)+$")
+    while True:
+        match = pattern.search(trimmed)
+        if not match:
+            break
+        trimmed = trimmed[:match.start()]
+    return start_pos + len(trimmed)
+
+
 def match_patterns_and_extract(content: str, start_patterns: List[Dict], end_patterns: List[Dict]) -> List[Dict]:
     """
     Associe chaque début à la signature la plus proche après lui, à condition
@@ -212,6 +255,7 @@ def match_patterns_and_extract(content: str, start_patterns: List[Dict], end_pat
         if best_end:
             start_pattern_pos = start_info["position"]
             end_pattern_end_pos = best_end.get("end_position", len(content))
+            end_pattern_end_pos = _trim_trailing_page_markers(content, start_pattern_pos, end_pattern_end_pos)
             complete_legal_text = content[start_pattern_pos:end_pattern_end_pos].strip()
 
             if len(complete_legal_text) > 50:
@@ -248,6 +292,25 @@ def _format_page_label(doc: Dict) -> str:
 
     end_display = end_page + 1
     return f"{start_display}-{end_display}"
+
+
+def _renumber_embedded_page_markers(legal_text: str) -> str:
+    """
+    Un texte multi-pages contient des marqueurs '=== Page N ===' hérités
+    directement de `content` (voir jsonl_adapter.py / extract_page_numbers),
+    avec le numéro de page INTERNE (0-indexé, celui du JSONL) -- alors que le
+    champ '• Page:' affiché juste au-dessus utilise déjà le numéro humain
+    (+1, celui du vrai PDF). Sans ce correctif, on se retrouve avec un
+    marqueur '=== Page 9 ===' à l'intérieur du texte alors que '• Page:'
+    annonce '10' pour ce même passage -- déroutant et incohérent.
+    Cette fonction réapplique le même +1 à CHAQUE marqueur trouvé dans le
+    texte, pour que la numérotation soit cohérente partout dans le fichier.
+    """
+    def _bump(match: re.Match) -> str:
+        internal_page = int(match.group(1))
+        return f"=== Page {internal_page + 1} ==="
+
+    return re.sub(r"===\s*Page\s*(\d+)\s*===", _bump, legal_text)
 
 
 def save_extracted_documents(documents: List[Dict], output_file: str):
@@ -301,7 +364,7 @@ def save_extracted_documents(documents: List[Dict], output_file: str):
                 f.write(f"• Page: {_format_page_label(doc)}\n")
                 f.write("\n")
                 f.write("• LEGAL TEXT:\n")
-                f.write(doc.get("legal_text", "").strip())
+                f.write(_renumber_embedded_page_markers(doc.get("legal_text", "").strip()))
                 f.write("\n\n\n")
                 f.write("+" * 80 + "\n\n")
 

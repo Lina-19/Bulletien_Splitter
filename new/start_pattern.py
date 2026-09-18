@@ -46,6 +46,11 @@ KEYWORDS = [
     "ظہیر",
     "ظهير شريف",
     "ظہیر شريف",
+    "ظهر شريف",  # variante OCR de "ظهير شريف" (le ي est parfois perdu par l'OCR --
+                 # confirmé sur BO_3405 : 3 occurrences mal océrisées contre 1 correcte).
+                 # On n'ajoute PAS "ظهر" seul : c'est un mot arabe courant ("dos"/"apparaître"),
+                 # l'ajouter causerait beaucoup de faux positifs. "ظهر شريف" en 2 mots reste
+                 # un signal fiable.
     "قرار مشترك",
     "قرار تأديبي",
     "منشور",
@@ -117,6 +122,53 @@ def build_no_signature_pattern() -> str:
     sorted_keywords = sorted(KEYWORDS_NO_SIGNATURE, key=len, reverse=True)
     keywords_pattern = "|".join(re.escape(k) for k in sorted_keywords)
     return rf"^(?P<keyword>{keywords_pattern})(?=\s|$|[،:؛\.\)])"
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Distance d'édition simple (insertions/suppressions/substitutions), sans dépendance externe."""
+    if a == b:
+        return 0
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (ca != cb))
+        prev = curr
+    return prev[-1]
+
+
+# Distance d'édition maximale tolérée pour un match "flou" (1 = une seule
+# lettre en trop/en moins/substituée, comme le ي manquant de ظهير -> ظهر).
+FUZZY_MAX_DISTANCE = 1
+
+
+def find_fuzzy_keyword_match(stripped_line: str):
+    """
+    Cherche un mot-clé approximatif en début de ligne quand aucun match exact
+    n'a été trouvé -- pour attraper des fautes d'OCR qu'on n'a pas anticipées
+    (comme ظهر au lieu de ظهير), sans avoir à lister chaque variante possible
+    à la main. Renvoie (mot_clé_canonique, longueur_du_texte_matché) ou None.
+
+    Ces candidats sont plus risqués qu'un match exact (une distance de 1 peut
+    aussi matcher un mot totalement différent par coïncidence) : ils sont
+    marqués 'fuzzy_matched': True dans extract_start_info, et le pipeline les
+    traite avec une politique fail-CLOSED côté Gemma (voir gemma_verifier.py) :
+    contrairement aux candidats normaux, un candidat flou est écarté si Gemma
+    ne le confirme pas explicitement, ou si la vérification Gemma est désactivée.
+    """
+    for kw in sorted(KEYWORDS, key=len, reverse=True):
+        for delta in (0, -1, 1):
+            length = len(kw) + delta
+            if length <= 0 or length > len(stripped_line):
+                continue
+            prefix = stripped_line[:length]
+            if prefix == kw:
+                continue  # déjà géré par le match exact
+            if _levenshtein(prefix, kw) <= FUZZY_MAX_DISTANCE:
+                after = stripped_line[length:length + 1]
+                if after == "" or after in " \t،:؛.)":
+                    return kw, length
+    return None
 
 
 def extract_sequential_info(
@@ -249,6 +301,23 @@ def extract_start_info(text: str) -> List[Dict]:
             result = extract_sequential_info(text, match.group("keyword"), kw_start, kw_end)
             if result:
                 result["has_signature"] = True
+                results.append(result)
+            line_start += len(line) + 1
+            continue
+
+        # Ni match exact avec signature, ni sans signature : on tente un match
+        # flou (tolérant 1 caractère) avant d'abandonner cette ligne. Voir
+        # find_fuzzy_keyword_match pour la politique de vérification associée.
+        fuzzy = find_fuzzy_keyword_match(stripped)
+        if fuzzy:
+            canonical_kw, matched_len = fuzzy
+            kw_start = line_start + leading_offset
+            kw_end = line_start + leading_offset + matched_len
+            result = extract_sequential_info(text, canonical_kw, kw_start, kw_end)
+            if result:
+                result["has_signature"] = True
+                result["fuzzy_matched"] = True
+                result["surface_form"] = stripped[:matched_len]
                 results.append(result)
 
         line_start += len(line) + 1  # +1 pour le \n retiré par split

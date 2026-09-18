@@ -39,6 +39,7 @@ from typing import List, Dict, Tuple
 try:
     from arabic_legal_extractor import (
         normalize_md_headers,
+        extract_page_numbers,
         extract_legal_documents_from_content,
         save_extracted_documents,
     )
@@ -116,7 +117,19 @@ def extract_legal_documents_from_jsonl(file_path: str, use_gemma_verification: b
     print(f"✅ {len(pages)} pages chargées depuis {file_path}")
 
     content, page_positions, block_positions = build_content_from_pages(pages)
+
+    # IMPORTANT : normalize_md_headers() supprime des caractères (titres
+    # markdown, puces...) et donc DÉCALE toutes les positions qui suivent.
+    # page_positions a été calculé sur le contenu BRUT (avant normalisation) ;
+    # l'utiliser tel quel après normalisation le désynchronise progressivement
+    # du contenu réellement utilisé par tout le reste du pipeline (le
+    # décalage grandit au fil du document, plus on avance, plus les
+    # numéros de page affichés deviennent faux). On le recalcule donc sur le
+    # contenu déjà normalisé, exactement comme le fait extract_legal_documents
+    # (le chemin "fichier texte brut") dans arabic_legal_extractor.py.
     content = normalize_md_headers(content)
+    page_positions = extract_page_numbers(content)
+
     print(f"📄 Contenu assemblé : {len(content)} caractères, {len(block_positions)} blocks")
 
     return extract_legal_documents_from_content(content, page_positions, use_gemma_verification)

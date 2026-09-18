@@ -111,17 +111,29 @@ def extract_json_object(raw_text: str) -> Dict[str, Any]:
     Les modèles renvoient parfois le JSON entouré de ```json ... ``` ou de
     texte parasite. Cette fonction essaie d'extraire un objet JSON valide
     de façon tolérante.
+
+    Elle tolère aussi les retours à la ligne littéraux non échappés à
+    l'intérieur des chaînes JSON (ex: {"clé": "ligne1\\nligne2"} écrit avec un
+    vrai saut de ligne au lieu de \\n) -- un défaut assez courant chez les
+    LLM qui casserait sinon un json.loads() strict.
     """
     cleaned = raw_text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip()
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
+    for candidate in (cleaned, _extract_braces(cleaned)):
+        if not candidate:
+            continue
+        for strict in (True, False):
+            try:
+                return json.loads(candidate, strict=strict)
+            except json.JSONDecodeError:
+                continue
 
-    match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-    if match:
-        return json.loads(match.group(0))
+    raise ValueError(f"Impossible d'extraire un JSON de la réponse : {raw_text[:300]}")
+
+
+def _extract_braces(text: str) -> Optional[str]:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    return match.group(0) if match else None
 
     raise ValueError(f"Impossible d'extraire un JSON de la réponse : {raw_text[:300]}")
