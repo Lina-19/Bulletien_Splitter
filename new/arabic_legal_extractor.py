@@ -110,7 +110,18 @@ def extract_legal_documents_from_content(
     # pas gaspiller des appels API sur des candidats qu'on ne veut pas garder
     # de toute façon.
     n_no_sig_dropped = sum(1 for p in start_patterns if not p.get("has_signature", True))
+    # Positions de TOUS les débuts détectés (y compris annonces/sommaire),
+    # utilisées comme bornes de fin pour les textes sans signature trouvée.
+    all_start_boundaries = sorted(p["start_position"] for p in start_patterns
+                                  if p.get("start_position") is not None)
     start_patterns = [p for p in start_patterns if p.get("has_signature", True)]
+
+    # Formes abrégées ("بموجب قرار ...") mises de côté AVANT la vérification
+    # Gemma : son prompt lui demande de rejeter les "références à un autre
+    # texte", ce qu'un avis "بموجب" ressemble à s'y méprendre. Elles ont leur
+    # propre traitement (extract_abbreviated_documents).
+    abbreviated_patterns = [p for p in start_patterns if p.get("abbreviated")]
+    start_patterns = [p for p in start_patterns if not p.get("abbreviated")]
     print(f"🔍 Found {n_total_detected} start patterns "
           f"({n_no_sig_dropped} sans signature écartés, {len(start_patterns)} retenus)")
 
@@ -143,7 +154,9 @@ def extract_legal_documents_from_content(
 
     print(f"   ✍️  {len(start_patterns)} textes avec signature retenus au total")
 
-    legal_documents = match_patterns_and_extract(content, start_patterns, end_patterns)
+    legal_documents = match_patterns_and_extract(content, start_patterns, end_patterns, all_start_boundaries)
+    legal_documents += extract_abbreviated_documents(content, abbreviated_patterns,
+                                                     all_start_boundaries, legal_documents)
 
     all_documents = legal_documents
     all_documents.sort(key=lambda x: x["start_position"])
@@ -219,7 +232,27 @@ def _trim_trailing_page_markers(content: str, start_pos: int, end_pos: int) -> i
     return start_pos + len(trimmed)
 
 
-def match_patterns_and_extract(content: str, start_patterns: List[Dict], end_patterns: List[Dict]) -> List[Dict]:
+# Longueur minimale d'un texte SANS signature trouvée. Filtre les entrées du
+# sommaire (فهرست), qui sont détectées comme débuts mais ne font qu'une ou
+# deux lignes avant l'entrée suivante.
+MIN_UNSIGNED_TEXT_CHARS = 400
+
+# Un vrai texte juridique a un CORPS (visas, dispositif, articles). Une entrée
+# de sommaire n'est qu'un titre. On exige au moins un de ces marqueurs pour
+# garder un texte dont aucune signature n'a été trouvée.
+_BODY_MARKERS = re.compile(
+    r"بناء\s+على|بمقتضى|يقرر|يرسم|الفصل|المادة|تمنح|الحمد\s+لله|إن\s+(?:وزير|الوزير|الأمين|المدير|رئيس|كاتب)"
+)
+
+
+def _number_key(number: str) -> str:
+    """Numéro normalisé (l'OCR inverse souvent '1289.77' / '77.1289')."""
+    parts = [x for x in re.split(r"[\.\-/\s]", number or "") if x]
+    return ".".join(sorted(parts))
+
+
+def match_patterns_and_extract(content: str, start_patterns: List[Dict], end_patterns: List[Dict],
+                               boundary_positions: Optional[List[int]] = None) -> List[Dict]:
     """
     Associe chaque début à la signature la plus proche après lui, à condition
     qu'aucun autre début ne s'intercale entre les deux.
@@ -269,7 +302,95 @@ def match_patterns_and_extract(content: str, start_patterns: List[Dict], end_pat
                     "text_length": len(complete_legal_text),
                     "has_signature": True,
                 })
+        else:
+            # AUCUNE signature trouvée avant le texte suivant. AVANT : le texte
+            # était abandonné silencieusement (ex: arrêtés de pension
+            # "تمنح وتسجل في السجل العام للمعاشات..." qui sont des tableaux
+            # sans signature, ou signature illisible à l'OCR). MAINTENANT : on
+            # garde le texte, jusqu'au début du texte suivant.
+            start_pattern_pos = start_info["position"]
+            bounds = boundary_positions or [o["position"] for o in start_positions]
+            next_starts = [b for b in bounds if b > start_info["end_position"]]
+            end_pos = next_starts[0] if next_starts else len(content)
+            end_pos = _trim_trailing_page_markers(content, start_pattern_pos, end_pos)
+            complete_legal_text = content[start_pattern_pos:end_pos].strip()
+
+            # Marqueurs cherchés dans le texte ENTIER : sur les arrêtés de
+            # pension, "تمنح" est dans le titre (absorbé par l'extraction de la
+            # date), pas après. Les entrées de sommaire, qui peuvent aussi
+            # contenir "تمنح", restent filtrées par la longueur minimale.
+            if len(complete_legal_text) >= MIN_UNSIGNED_TEXT_CHARS and _BODY_MARKERS.search(complete_legal_text):
+                legal_documents.append({
+                    "document_number": i + 1,
+                    "start_pattern": start_info["pattern"],
+                    "end_pattern": {"type": "Sans signature", "key_signature": "",
+                                    "names": "", "limit": "(début du texte suivant)"},
+                    "legal_text": complete_legal_text,
+                    "start_position": start_pattern_pos,
+                    "end_position": end_pos,
+                    "text_length": len(complete_legal_text),
+                    "has_signature": False,
+                })
+
+    # Un texte sans signature dont le numéro correspond à un texte SIGNÉ déjà
+    # extrait est un doublon (entrée de sommaire) : on l'écarte.
+    signed_keys = {_number_key(d["start_pattern"].get("number", ""))
+                   for d in legal_documents if d["has_signature"]} - {""}
+    legal_documents = [d for d in legal_documents if d["has_signature"]
+                       or _number_key(d["start_pattern"].get("number", "")) not in signed_keys]
     return legal_documents
+
+
+# Fin de paragraphe d'un avis abrégé : ligne "**" (séparateur du BO entre
+# deux avis) ou séparateur visuel de 3+ caractères, ou rubrique du BO.
+_ABBREVIATED_END = re.compile(
+    r"(?m)^[ \t]*(?:\*{2,}|[*=\-+#]{3,})[ \t]*$"
+    r"|^[ \t]*(?:إعلانات|اعلانات|نصوص عامة|نصوص خاصة|حركات الموظفين|نظام المياه)"
+)
+MIN_ABBREVIATED_TEXT_CHARS = 120
+
+
+def extract_abbreviated_documents(content: str, abbreviated_patterns: List[Dict],
+                                  boundary_positions: List[int], existing_docs: List[Dict]) -> List[Dict]:
+    """
+    Textes en forme abrégée ("بموجب قرار ... رقم X بتاريخ ..."), sans signature.
+    Traités À PART de l'appariement début/signature : "بموجب" peut aussi
+    ouvrir une ligne dans le corps d'un texte signé, et le laisser participer
+    à l'appariement lui ferait voler la signature de ce texte (comme les
+    citations de titre). Pour la même raison, un avis qui tombe à l'intérieur
+    d'un texte déjà extrait est ignoré.
+
+    Un avis s'arrête à la fin de son paragraphe : séparateur "**", début du
+    texte/avis suivant, ou rubrique du BO.
+    """
+    spans = [(d["start_position"], d["end_position"]) for d in existing_docs]
+    docs = []
+    for pat in sorted(abbreviated_patterns, key=lambda x: x["start_position"]):
+        start = pat["start_position"]
+        if any(s <= start < e for s, e in spans):
+            continue  # "بموجب" dans le corps d'un texte déjà extrait
+
+        search_from = pat["end_position"]
+        candidates = [b for b in boundary_positions if b > search_from][:1]
+        m = _ABBREVIATED_END.search(content, search_from)
+        if m:
+            candidates.append(m.start())
+        end = min(candidates) if candidates else len(content)
+        end = _trim_trailing_page_markers(content, start, end)
+
+        text = content[start:end].strip()
+        if len(text) >= MIN_ABBREVIATED_TEXT_CHARS:
+            docs.append({
+                "start_pattern": pat,
+                "end_pattern": {"type": "Forme abrégée", "key_signature": "",
+                                "names": "", "limit": "(fin du paragraphe)"},
+                "legal_text": text,
+                "start_position": start,
+                "end_position": end,
+                "text_length": len(text),
+                "has_signature": False,
+            })
+    return docs
 
 
 def _format_page_label(doc: Dict) -> str:
