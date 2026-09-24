@@ -61,6 +61,136 @@ def load_jsonl_pages(file_path: str) -> List[Dict]:
     return pages
 
 
+# ---------------------------------------------------------------------------
+# Réparation des défauts d'ordre de l'OCR (avant tout traitement)
+# ---------------------------------------------------------------------------
+# Deux défauts récurrents de l'OCR, constatés sur BO_3405 (pages 19 et 31) :
+#
+# 1. TITRE REJETÉ EN FIN DE PAGE. Le titre en gras d'un arrêté, en haut de sa
+#    colonne sur le PDF, reçoit de fausses coordonnées et se retrouve en
+#    DERNIER bloc de la page, APRÈS son propre corps. Le pipeline voit alors un
+#    corps sans titre (ignoré) et un titre sans corps (écarté) : le texte
+#    entier disparaît (arrêtés 9.78 et 1336.77).
+#    -> Si la page commence par un corps "إن وزير X ،" sans titre, et que le
+#       DERNIER bloc est un titre qui cite ce même ministre ("قرار لوزير X"),
+#       on remet le titre devant le corps. Sans correspondance du ministre, on
+#       ne touche à rien (une page qui commence par un corps est souvent
+#       normale : le titre est en bas de la page précédente).
+#
+# 3. SIGNATURE RANGÉE APRÈS UN AUTRE TEXTE. Constaté sur l'arrêté 1336.77 :
+#    sa signature, juste sous "ينشر هذا القرار بالجريدة الرسمية", était lue
+#    après tout l'arrêté 1257.77 situé plus bas -> 1336.77 perdait sa
+#    signature. Voir la règle (étroite) dans repair_page_blocks.
+#
+# 2. BLOC DE SIGNATURE LU DEUX FOIS. Une suite de blocs identique répétée
+#    immédiatement ("الفصل الثاني ... الإمضاء : ..." ×2). On ne supprime la
+#    répétition que si elle contient une signature ou "وحرر" : des annonces
+#    distinctes peuvent avoir légitimement le même texte, on n'y touche pas.
+
+import re as _re
+from start_pattern import extract_start_info as _extract_start_info
+
+_BODY_OPENER = _re.compile(r"^\s*إن\s+(?P<who>[^،,\n]{3,70}?)\s*[،,]")
+_SIG_MARK = _re.compile(r"الإمضاء|الامضاء|وحرر")
+_SIG_START = _re.compile(r"^\s*وحـ*رر")
+_SIGNER = _re.compile(r"(?:الإمضاء|الامضاء|إمضاء|امضاء|التوقيع)\s*:")
+_SIG_BLOCK = _re.compile(r"^\s*وحـ*رر|(?:الإمضاء|الامضاء|التوقيع)\s*:|وقعه\s+بالعطف")
+SIG_MAX_GAP_ABOVE = 150      # écart vertical maximal avec le bloc du dessus
+SIG_GAP_TOLERANCE = 30       # léger chevauchement toléré
+SIG_ADJACENT_TOL = 5         # deux blocs jointifs (bas de l'un = haut de l'autre)
+SIG_RUN_MAX_GAP = 60         # écart max entre deux lignes d'un même bloc de signature
+SIG_RUN_MAX_BLOCKS = 4       # un bloc de signature tient en quelques lignes
+SIG_RUN_MAX_LINE_CHARS = 80  # ...et ces lignes sont courtes ("الإمضاء : ...")
+                             # Sans ces deux limites, le regroupement happait
+                             # le texte courant qui suit (13 blocs déplacés sur
+                             # BO_3405 p.34 -> l'arrêté 1262.77 disparaissait).
+
+
+def _norm(s: str) -> str:
+    return _re.sub(r"\s+", " ", s.replace("#", "").replace("ـ", "")).strip()
+
+
+def repair_page_blocks(blocks: List[Dict]) -> Tuple[List[Dict], List[str]]:
+    repairs: List[str] = []
+    blocks = list(blocks)
+
+    # --- 2. suites de blocs répétées contenant une signature ---
+    i = 0
+    while i < len(blocks):
+        removed = False
+        for k in range(min(8, (len(blocks) - i) // 2), 1, -1):
+            run = [_norm(b.get("content", "")) for b in blocks[i:i + k]]
+            nxt = [_norm(b.get("content", "")) for b in blocks[i + k:i + 2 * k]]
+            if run == nxt and _SIG_MARK.search(" ".join(run)):
+                del blocks[i + k:i + 2 * k]
+                repairs.append(f"{k} blocs de signature dupliqués supprimés")
+                removed = True
+                break
+        if not removed:
+            i += 1
+
+    # --- 3. bloc de signature rangé après un texte situé plus bas ---
+    # Règle GÉOMÉTRIQUE, appliquée UNIQUEMENT aux blocs de signature (وحرر,
+    # "الإمضاء :", "وقعه بالعطف") : l'OCR les range souvent avec la colonne de
+    # gauche du bas de page alors qu'ils appartiennent à la bande du dessus.
+    # Un bloc de signature S est déplacé si :
+    #   a) tous les blocs qui le précèdent, jusqu'à un bloc P, sont ENTIÈREMENT
+    #      SOUS lui (ils appartiennent donc à une bande inférieure) ;
+    #   b) P se trouve juste au-dessus de S (écart vertical faible).
+    # S est alors replacé juste après P.
+    # Ne s'applique qu'aux signatures : la même règle appliquée à tous les
+    # blocs réordonnait des milliers de blocs sur des pages normales.
+    # La condition (b) protège le cas normal "signature en haut de la colonne
+    # de gauche" : le bloc situé au-dessus est alors très loin (ou en dessous).
+    def _top(b): return b.get("top_left_y", 0) or 0
+    def _bottom(b): return b.get("bottom_right_y", 0) or 0
+    j = 0
+    while j < len(blocks):
+        blk = blocks[j]
+        txt = _norm(blk.get("content", ""))
+        if _SIG_BLOCK.search(txt) and j > 0 and _top(blocks[j - 1]) > _bottom(blk):
+            i = j
+            while i > 0 and blocks[i - 1].get("type") not in ("header", "footer") \
+                    and _top(blocks[i - 1]) >= _bottom(blk) - SIG_ADJACENT_TOL:
+                i -= 1
+            gap = _top(blk) - _bottom(blocks[i - 1]) if i > 0 else None
+            if i < j and gap is not None and -SIG_GAP_TOLERANCE <= gap <= SIG_MAX_GAP_ABOVE:
+                # Le bloc de signature s'étend sur plusieurs blocs collés
+                # ("وحرر ..." / "الوزير الأول ،" / "الإمضاء : ..."). On les
+                # déplace ENSEMBLE : pris isolément, "الوزير الأول ،" ne
+                # ressemble pas à une signature et serait resté en arrière.
+                k = j + 1
+                while (k < len(blocks) and k - j < SIG_RUN_MAX_BLOCKS
+                       and 0 <= _top(blocks[k]) - _bottom(blocks[k - 1]) <= SIG_RUN_MAX_GAP
+                       and len(_norm(blocks[k].get("content", ""))) <= SIG_RUN_MAX_LINE_CHARS):
+                    k += 1
+                run = blocks[j:k]
+                del blocks[j:k]
+                blocks[i:i] = run
+                repairs.append(f"signature ({len(run)} bloc(s)) remontée dans sa bande, "
+                               f"{j - i} bloc(s) plus bas sautés : {txt[:45]}")
+                j = i + len(run)
+                continue
+        j += 1
+
+    # --- 1. titre rejeté en fin de page ---
+    content_idx = [j for j, b in enumerate(blocks)
+                   if b.get("type") not in ("header", "footer") and b.get("content", "").strip()]
+    if len(content_idx) >= 3:
+        first_j, last_j = content_idx[0], content_idx[-1]
+        first = _norm(blocks[first_j]["content"])
+        last = _norm(blocks[last_j]["content"])
+        opener = _BODY_OPENER.match(first)
+        if opener and _extract_start_info(last):
+            who = _norm(opener.group("who"))
+            if who and who in last:
+                title = blocks.pop(last_j)
+                blocks.insert(first_j, title)
+                repairs.append(f"titre remis devant son corps : {last[:60]}")
+
+    return blocks, repairs
+
+
 def build_content_from_pages(pages: List[Dict]) -> Tuple[str, List[Dict], List[Dict]]:
     """
     Construit :
@@ -83,7 +213,11 @@ def build_content_from_pages(pages: List[Dict]) -> Tuple[str, List[Dict], List[D
         page_positions.append({"page_number": page["page"], "position": cursor})
         cursor += len(marker)
 
-        for block in page.get("blocks", []):
+        page_blocks, repairs = repair_page_blocks(page.get("blocks", []))
+        for r in repairs:
+            print(f"   🔧 Page {page['page'] + 1} : {r}")
+
+        for block in page_blocks:
             block_text = block.get("content", "")
             if not block_text:
                 continue

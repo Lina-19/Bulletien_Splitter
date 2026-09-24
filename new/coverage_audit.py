@@ -34,8 +34,11 @@ from arabic_legal_extractor import (
     extract_legal_documents_from_content,
 )
 
+# Les avis en forme abrégée ("بموجب قرار ...") ne sont pas extraits
+# volontairement (voir EXTRACT_ABBREVIATED_NOTICES) : l'audit ne les compte
+# donc pas comme des textes manquants.
 _HEADING = re.compile(
-    rf"(?m)^[ \t]*(?:بموجب\s+)?(?P<kw>{'|'.join(sorted(KEYWORDS, key=len, reverse=True))}|ظهر شريف)(?=\s)"
+    rf"(?m)^[ \t]*(?P<kw>{'|'.join(sorted(KEYWORDS, key=len, reverse=True))}|ظهر شريف)(?=\s)"
 )
 _DATE_NEAR = re.compile(r"بتاريخ|صادر\s*في|صادرة\s*في|المؤرخ")
 _NUMBER = re.compile(r"(?:رقم|عدد)\s+([\d][\d\.\-/]*[\d])")

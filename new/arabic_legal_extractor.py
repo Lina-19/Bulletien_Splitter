@@ -33,8 +33,14 @@ except ImportError as e:
 try:
     from gemma_verifier import verify_start_candidates, verify_end_candidates, clean_documents_trailing_content
     GEMMA_AVAILABLE = True
+    try:
+        from gemma_start_detector import detect_missed_starts
+        GEMMA_DETECTION_AVAILABLE = True
+    except ImportError:
+        GEMMA_DETECTION_AVAILABLE = False
 except ImportError:
     GEMMA_AVAILABLE = False
+    GEMMA_DETECTION_AVAILABLE = False
 
 
 def normalize_md_headers(text: str) -> str:
@@ -102,6 +108,23 @@ def extract_legal_documents_from_content(
     (détection, vérification Gemma optionnelle, matching, étiquetage pages).
     """
     start_patterns = extract_start_info(content)
+
+    # Détection HYBRIDE : Gemma lit chaque page et rattrape les débuts que les
+    # regex ont ratés (voir gemma_start_detector.py). Ajoutés AVANT le calcul
+    # des bornes, pour qu'aucun texte ne déborde sur un texte trouvé par Gemma.
+    gemma_found_starts: List[Dict] = []
+    if use_gemma_verification and GEMMA_AVAILABLE and GEMMA_DETECTION_AVAILABLE:
+        # Passe préalable "regex seules" (rapide, silencieuse) pour connaître
+        # les textes SIGNÉS déjà bien extraits : Gemma n'a pas le droit
+        # d'ajouter un début à l'intérieur (voir gemma_start_detector.py).
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            regex_only_docs = extract_legal_documents_from_content(content, page_positions, False)
+        protected = [(d["start_position"], d["end_position"])
+                     for d in regex_only_docs if d.get("has_signature")]
+        gemma_found_starts = detect_missed_starts(content, page_positions, start_patterns, protected)
+        start_patterns = start_patterns + gemma_found_starts
+
     n_total_detected = len(start_patterns)
 
     # On ne garde que les textes AVEC signature (قرار/مرسوم/ظهير/قانون/منشور/
@@ -132,8 +155,12 @@ def extract_legal_documents_from_content(
         if not GEMMA_AVAILABLE:
             print("⚠️  gemma_verifier.py introuvable, vérification Gemma ignorée.")
         else:
+            # Les débuts trouvés par Gemma lui-même ne repassent pas par la
+            # vérification (déjà validés par lui + garde-fous : appel inutile).
+            from_gemma = [p for p in start_patterns if p.get("source") == "gemma"]
+            start_patterns = [p for p in start_patterns if p.get("source") != "gemma"]
             n_before = len(start_patterns)
-            start_patterns = verify_start_candidates(content, start_patterns)
+            start_patterns = verify_start_candidates(content, start_patterns) + from_gemma
             print(f"🤖 Gemma : {n_before - len(start_patterns)} faux positifs de début écartés "
                   f"({len(start_patterns)} confirmés/gardés)")
 
@@ -155,8 +182,14 @@ def extract_legal_documents_from_content(
     print(f"   ✍️  {len(start_patterns)} textes avec signature retenus au total")
 
     legal_documents = match_patterns_and_extract(content, start_patterns, end_patterns, all_start_boundaries)
-    legal_documents += extract_abbreviated_documents(content, abbreviated_patterns,
-                                                     all_start_boundaries, legal_documents)
+
+    # Les avis en forme abrégée ("بموجب قرار ... رقم X") ne sont PAS produits en
+    # sortie : seuls les textes juridiques complets sont voulus. Ils restent
+    # détectés (abbreviated_patterns figure dans all_start_boundaries) car ils
+    # servent de borne de fin aux textes qui les précèdent.
+    if EXTRACT_ABBREVIATED_NOTICES:
+        legal_documents += extract_abbreviated_documents(content, abbreviated_patterns,
+                                                         all_start_boundaries, legal_documents)
 
     all_documents = legal_documents
     all_documents.sort(key=lambda x: x["start_position"])
@@ -236,6 +269,11 @@ def _trim_trailing_page_markers(content: str, start_pos: int, end_pos: int) -> i
 # sommaire (فهرست), qui sont détectées comme débuts mais ne font qu'une ou
 # deux lignes avant l'entrée suivante.
 MIN_UNSIGNED_TEXT_CHARS = 400
+
+# Avis publiés en forme abrégée ("بموجب قرار لوزير ... رقم X بتاريخ ..." :
+# fermetures de route, avis d'enquête, permis miniers...). Mis à False : seuls
+# les textes juridiques complets sont demandés. Passer à True pour les inclure.
+EXTRACT_ABBREVIATED_NOTICES = False
 
 # Un vrai texte juridique a un CORPS (visas, dispositif, articles). Une entrée
 # de sommaire n'est qu'un titre. On exige au moins un de ces marqueurs pour
@@ -350,6 +388,32 @@ _ABBREVIATED_END = re.compile(
 MIN_ABBREVIATED_TEXT_CHARS = 120
 
 
+_BO_HEADER_LINES = re.compile(r"^\s*(?:الجريدة\s+الرسمية|عدد\s+\d+\s*-.*|===\s*Page\s*\d+\s*===)\s*$")
+
+
+def _drop_next_notice_heading(content: str, start: int, end: int) -> int:
+    """
+    Un avis abrégé est précédé de son intitulé ("منع السير بصفة مؤقتة ...").
+    Quand deux avis sont séparés par un saut de page (et non par "**"),
+    l'intitulé de l'avis SUIVANT restait collé à la fin du précédent
+    (constaté : avis 986.77, BO_3405 p.19-20). Si, après un saut de page,
+    il ne reste qu'un seul paragraphe avant la borne, et que le texte avant
+    le saut de page se termine par un point final, ce paragraphe est
+    l'intitulé de l'avis suivant : on coupe avant le saut de page.
+    """
+    seg = content[start:end]
+    marker = list(re.finditer(r"===\s*Page\s*\d+\s*===", seg))
+    if not marker:
+        return end
+    m = marker[-1]
+    before = seg[:m.start()].rstrip()
+    after = [l for l in seg[m.end():].split("\n") if l.strip() and not _BO_HEADER_LINES.match(l)]
+    paragraphs = [p for p in re.split(r"\n\s*\n", "\n".join(after)) if p.strip()]
+    if before.endswith(".") and len(paragraphs) == 1 and not paragraphs[0].lstrip().startswith("بموجب"):
+        return start + len(before)   # juste avant le saut de page (libellé de page correct)
+    return end
+
+
 def extract_abbreviated_documents(content: str, abbreviated_patterns: List[Dict],
                                   boundary_positions: List[int], existing_docs: List[Dict]) -> List[Dict]:
     """
@@ -377,6 +441,7 @@ def extract_abbreviated_documents(content: str, abbreviated_patterns: List[Dict]
             candidates.append(m.start())
         end = min(candidates) if candidates else len(content)
         end = _trim_trailing_page_markers(content, start, end)
+        end = _drop_next_notice_heading(content, start, end)
 
         text = content[start:end].strip()
         if len(text) >= MIN_ABBREVIATED_TEXT_CHARS:
