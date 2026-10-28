@@ -67,6 +67,10 @@ _KEYWORD_FIRST_WORDS = sorted({k.split()[0] for k in KEYWORDS})
 
 
 def _first_word_is_keyword_like(line: str) -> bool:
+    # Les dahirs anciens sont précédés de "الحمد لله وحده" — c'est une
+    # formule connue et fiable, pas un mot-clé générique à scorer.
+    if re.match(r"^\s*الحمد\s+لله\s+وحده", line):
+        return True
     words = line.split()
     if words and words[0] == "بموجب":
         words = words[1:]
@@ -77,22 +81,35 @@ def _first_word_is_keyword_like(line: str) -> bool:
         return False
     return max(SequenceMatcher(None, w, k).ratio() for k in _KEYWORD_FIRST_WORDS) >= TITLE_WORD_MIN_SIMILARITY
 
-DETECTION_PROMPT = """أنت مساعد متخصص في تحليل الجريدة الرسمية المغربية.
+DETECTION_PROMPT = """أنت مساعد متخصص في تحليل الجريدة الرسمية المغربية بجميع حقبها (من عهد الحماية إلى اليوم).
 
 فيما يلي نص صفحة واحدة من الجريدة الرسمية (مستخرج بالتعرف الضوئي، وقد يحتوي أخطاء).
 
-المهمة: استخرج عنوان كل نص قانوني يبدأ في هذه الصفحة:
-ظهير شريف، ظهير، قانون، مرسوم، قرار، قرار مشترك، مقرر، منشور، مذكرة،
-وكذلك الصيغة المختصرة التي تبدأ بـ"بموجب قرار ..." أو "بموجب مرسوم ...".
+المهمة: استخرج عنوان كل نص قانوني يبدأ في هذه الصفحة.
+
+أنواع النصوص القانونية الحديثة (بعد 1956):
+ظهير شريف، ظهير، قانون، مرسوم، قرار، قرار مشترك، مقرر، منشور، مذكرة
+
+أنواع النصوص القانونية القديمة (عهد الحماية، قبل 1956) — مهم جداً:
+- ظهير شريف بدون رقم ولا تاريخ في العنوان، يسبقه عادةً "الحمد لله وحده"
+  مثال: "الحمد لله وحده\nظهير شريف\nفي الإذن بجعل حسابات..."
+- قرار وزيري (بدلاً من "قرار" المعتاد)
+  مثال: "قرار وزيري في المصادقة على..."
+- ظهير شريف مسبوق بـ "الحمد لله وحده" مباشرة بدون نص بينهما
+
+علامات بداية النص القانوني القديم:
+- السطر "الحمد لله وحده" يعني أن ظهيراً شريفاً يبدأ بعده مباشرة
+- العبارة "يعلم من كتابنا هذا أسماه الله..." تعني بداية ظهير
 
 لا تستخرج:
 - عناوين الفهرست (جدول المحتويات في بداية العدد)
 - الإحالات إلى نصوص أخرى داخل التأشيرات ("بناء على الظهير..."، "وعلى المرسوم...")
-- نصا مذكورا داخل عنوان نص آخر
+- نصاً مذكوراً داخل عنوان نص آخر
 - الإعلانات والبلاغات العادية
 
 لكل نص: انسخ السطر الأول من عنوانه حرفيا، حرفا بحرف، كما هو مكتوب في
-الصفحة (حتى لو كانت فيه أخطاء)، وحدد نوعه.
+الصفحة (حتى لو كانت فيه أخطاء). إذا كان عنوانه مسبوقاً بـ"الحمد لله وحده"،
+ابدأ النسخ من هذه العبارة.
 
 نص الصفحة:
 ---
@@ -150,13 +167,15 @@ def _build_candidate(content: str, pos: int, gemma_type: str) -> Optional[Dict]:
     line_end = content.find("\n", pos)
     line = content[pos:line_end if line_end != -1 else len(content)]
 
+    is_old_dahir = bool(re.match(r"^\s*الحمد\s+لله\s+وحده", line))
+
     if _CITATION_PREFIXES.match(line):
         return None                                  # garde-fou 3 : citation
-    if not _YEAR.search(content[pos:pos + YEAR_WINDOW]):
+    if not is_old_dahir and not _YEAR.search(content[pos:pos + YEAR_WINDOW]):
         return None                                  # garde-fou 4 : pas de date
     if not _first_word_is_keyword_like(line):
         return None                                  # garde-fou 5 : premier mot
-    if not _TITLE_STRUCTURE.search(content[pos:pos + TITLE_STRUCTURE_WINDOW]):
+    if not is_old_dahir and not _TITLE_STRUCTURE.search(content[pos:pos + TITLE_STRUCTURE_WINDOW]):
         return None                                  # garde-fou 6 : structure de titre
 
     abbreviated = line.lstrip().startswith("بموجب")

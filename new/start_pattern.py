@@ -70,6 +70,8 @@ DATE_INDICATORS = [
     r"بتاريخ\s*",
     "المؤرخ في",
     "المؤرخة في",
+    "المورخ في",
+    # Variante sans tachkil, fréquente dans les vieux BO
 ]
 
 DATE_END_MARKERS = [

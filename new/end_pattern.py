@@ -120,6 +120,23 @@ _PAGE_MARKER_PATTERN = re.compile(r"===\s*Page\s*\d+\s*===")
 MAX_NAMES_SEARCH_CHARS = 500
 
 
+# ---------------------------------------------------------------------------
+# Signatures des BO de l'époque du Protectorat (avant ~1956)
+# Structure différente des textes modernes :
+#   اطلع عليه واذن بنشره        <- formule de promulgation (peut être absent)
+#   الرباط في <date>             <- lieu et date
+#   القوميسير المقيم العام : X   <- signataire(s)
+#   المعتمد بالاقامة العامة : Y  <- co-signataire(s)
+# ---------------------------------------------------------------------------
+PROTECTORATE_SIGNERS = [
+    "القوميسير المقيم العام", "المقيم العام",
+    "المعتمد بالاقامة العامة", "المعتمد الاقامة العامة",
+    "الكاتب العام للدولة", "الوزير الاكبر", "الوزير الكبير",
+]
+_PROTECTORATE_PREAMBLE = re.compile(r"اطلع عليه واذن بنشره")
+_PROTECTORATE_SIGNER   = re.compile(r"^(?:" + "|".join(re.escape(k) for k in PROTECTORATE_SIGNERS) + r")\s*:", re.MULTILINE)
+
+
 def extract_signatures_from_text(text: str) -> List[Dict]:
     """Extrait tous les blocs de signature (Type 1 : un signataire, Type 2 : plusieurs)."""
     results = []
@@ -187,6 +204,30 @@ def extract_signatures_from_text(text: str) -> List[Dict]:
             "type": "Type 2",
             "signature_indicator": "",
             "key_signature": keyword,
+            "names": names_block,
+            "limit": doc_limit_val or "",
+            "start_position": match.start(),
+            "end_position": doc_limit_pos if doc_limit_pos is not None else len(text),
+        })
+
+
+    # Type 3 : signatures protectorales
+    _p3 = re.compile(
+        r"اطلع\s+عليه\s+واذن\s+بنشره"
+        r"|^(?:" + "|".join(re.escape(k) for k in PROTECTORATE_SIGNERS) + r")\s*:",
+        re.MULTILINE)
+    for match in _p3.finditer(text):
+        names_start = match.end()
+        doc_limit_pos, doc_limit_val = find_document_limit(text, names_start)
+        names_display_pos, _ = find_names_display_limit(text, names_start)
+        names_block = text[names_start:names_display_pos].strip() if names_display_pos else text[names_start:].strip()
+        block_end = find_signature_block_end(text, names_start, "Type 1")
+        if doc_limit_pos is None or block_end < doc_limit_pos:
+            doc_limit_pos, doc_limit_val = block_end, "(fin du bloc de signature)"
+        results.append({
+            "type": "Type 3 (Protectorat)",
+            "signature_indicator": match.group(0),
+            "key_signature": match.group(0).split(":")[0].strip(),
             "names": names_block,
             "limit": doc_limit_val or "",
             "start_position": match.start(),

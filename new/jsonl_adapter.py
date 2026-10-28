@@ -274,19 +274,11 @@ def process_folder(
     output_dir: str = "extracted_files",
     use_gemma_verification: bool = True,
     pattern: str = "*.jsonl",
+    skip_existing: bool = False,
 ) -> Dict[str, int]:
     """
-    Boucle sur tous les fichiers .jsonl d'un dossier (ex: /input), extrait les
-    textes juridiques de chacun, et sauvegarde un fichier `<nom>_extracted.txt`
-    par fichier source dans `output_dir`.
-
-    Si un fichier plante (JSON invalide, page mal formée, erreur Gemma...),
-    on logue l'erreur et on PASSE AU SUIVANT plutôt que d'arrêter tout le lot
-    -- important pour un traitement en masse où un seul fichier corrompu ne
-    doit pas bloquer les autres.
-
-    Renvoie un résumé {nom_fichier: nombre_de_documents_extraits} (ou -1 en
-    cas d'échec sur ce fichier).
+    Boucle sur tous les fichiers .jsonl d'un dossier.
+    Si skip_existing=True, saute les fichiers dont le _extracted.txt existe déjà.
     """
     input_path = Path(input_dir)
     jsonl_files = sorted(input_path.glob(pattern))
@@ -295,7 +287,14 @@ def process_folder(
         print(f"⚠️  Aucun fichier '{pattern}' trouvé dans {input_dir}")
         return {}
 
-    print(f"📂 {len(jsonl_files)} fichier(s) trouvé(s) dans {input_dir}")
+    if skip_existing:
+        before = len(jsonl_files)
+        jsonl_files = [f for f in jsonl_files
+                       if not os.path.exists(os.path.join(output_dir, f"{f.stem}_extracted.txt"))]
+        print(f"📂 {before} fichier(s) trouvé(s), {before - len(jsonl_files)} déjà traité(s) ignoré(s), "
+              f"{len(jsonl_files)} à traiter")
+    else:
+        print(f"📂 {len(jsonl_files)} fichier(s) trouvé(s) dans {input_dir}")
     os.makedirs(output_dir, exist_ok=True)
 
     summary = {}
@@ -335,10 +334,13 @@ if __name__ == "__main__":
         sys.exit(1)
 
     use_gemma = "--no-gemma" not in sys.argv
+    skip_existing = "--skip-existing" in sys.argv
     target = sys.argv[1]
 
     if os.path.isdir(target):
-        process_folder(target, output_dir="extracted_files", use_gemma_verification=use_gemma)
+        process_folder(target, output_dir="extracted_files",
+                       use_gemma_verification=use_gemma,
+                       skip_existing=skip_existing)
     elif os.path.isfile(target):
         from arabic_legal_extractor import save_extracted_documents
 
